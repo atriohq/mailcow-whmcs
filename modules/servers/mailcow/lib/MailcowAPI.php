@@ -20,7 +20,6 @@ class MailcowAPI
     private int|string $numMailboxes;
     private int|string $mailboxQuota;
     private int|string $defaultQuota;
-    private int|string $unlimitedMailboxes;
     private int|string $rateLimitValue;
     private int|string $rateLimitFrame;
 
@@ -44,7 +43,6 @@ class MailcowAPI
         $this->numMailboxes = self::DEFAULT_MAILBOXES;
         $this->mailboxQuota = self::DEFAULT_MAILBOX_QUOTA;
         $this->defaultQuota = self::DEFAULT_DEF_QUOTA;
-        $this->unlimitedMailboxes = self::DEFAULT_DOMAIN_QUOTA;
         $this->rateLimitValue = self::DEFAULT_RL_VALUE;
         $this->rateLimitFrame = self::DEFAULT_RL_FRAME;
         $this->baseurl = 'https://' . rtrim($params['serverhostname'], '/');
@@ -164,6 +162,10 @@ class MailcowAPI
 
     public function removeDomainAdmin($params)
     {
+        if (empty($params['username'])) {
+            return ['status' => 'success', 'message' => 'No domain admin username provided'];
+        }
+
         return $this->_manageDomainAdmin($params['domain'], $params['username'], null, 'remove');
     }
 
