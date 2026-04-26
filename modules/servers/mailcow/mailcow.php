@@ -68,6 +68,12 @@ function mailcow_ConfigOptions()
             'Default' => 'v=spf1 mx -all',
             'Description' => 'Shown to customers as SPF TXT record',
         ],
+        'Max Mailboxes' => [
+            'Type' => 'text',
+            'Size' => '10',
+            'Default' => '10',
+            'Description' => 'Maximum number of mailboxes customer can create',
+        ],
     ];
 }
 
@@ -322,6 +328,21 @@ function mailcow_TestConnection(array $params)
     }
 }
 
+function mailcow_getMailboxLimit(array $params): int
+{
+    return (int)($params['configoption7'] ?? 10);
+}
+
+function mailcow_getDefaultMailboxQuota(array $params): int
+{
+    return (int)($params['configoption1'] ?? 1024);
+}
+
+function mailcow_generatePassword(int $length = 16): string
+{
+    return bin2hex(random_bytes((int)ceil($length / 2)));
+}
+
 /**
  * @param $params
  * @return string
@@ -342,6 +363,62 @@ function mailcow_ClientArea(array $params)
         $dkim = 'Unable to fetch DKIM record at this time.';
     }
 
+    $mailboxMessage = '';
+
+    try {
+        $mailcow = new MailcowAPI($params);
+
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['mailcow_action'])) {
+            $action = (string)$_POST['mailcow_action'];
+
+            if ($action === 'create_mailbox') {
+                $localPart = trim((string)($_POST['local_part'] ?? ''));
+                $password = trim((string)($_POST['password'] ?? ''));
+
+                if ($password === '') {
+                    $password = mailcow_generatePassword();
+                }
+
+                $mailboxes = $mailcow->getMailboxes($params);
+                $maxMailboxes = mailcow_getMailboxLimit($params);
+
+                if (count($mailboxes) >= $maxMailboxes) {
+                    throw new \RuntimeException('Mailbox limit reached.');
+                }
+
+                $mailcow->addMailbox(
+                    $params,
+                    $localPart,
+                    $password,
+                    mailcow_getDefaultMailboxQuota($params)
+                );
+
+                $mailboxMessage = 'Mailbox created. Password: ' . $password;
+            }
+
+            if ($action === 'delete_mailbox') {
+                $email = trim((string)($_POST['email'] ?? ''));
+
+                if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                    throw new \RuntimeException('Invalid mailbox address.');
+                }
+
+                if (!str_ends_with(strtolower($email), '@' . strtolower($params['domain']))) {
+                    throw new \RuntimeException('Mailbox does not belong to this domain.');
+                }
+
+                $mailcow->deleteMailbox($email);
+                $mailboxMessage = 'Mailbox deleted.';
+            }
+        }
+
+        $mailboxes = $mailcow->getMailboxes($params);
+
+    } catch (\Throwable $e) {
+        $mailboxMessage = $e->getMessage();
+        $mailboxes = [];
+    }
+
     $e = static function ($value): string {
         return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
     };
@@ -356,6 +433,36 @@ function mailcow_ClientArea(array $params)
     $mxHost = $e($params['configoption5'] ?? 'email.example.com');
     $spfRecord = $e($params['configoption6'] ?? 'v=spf1 mx -all');
     $dkimEsc = $e($dkim);
+    
+    $mailboxRows = '';
+
+    foreach ($mailboxes as $mailbox) {
+        $email = $e($mailbox['username'] ?? '');
+        $quota = $e($mailbox['quota'] ?? '');
+
+        if ($email === '') {
+            continue;
+        }
+
+        $mailboxRows .= '
+    <tr>
+        <td>' . $email . '</td>
+        <td>' . $quota . '</td>
+        <td>
+            <form method="post" style="display:inline;">
+                <input type="hidden" name="mailcow_action" value="delete_mailbox">
+                <input type="hidden" name="email" value="' . $email . '">
+                <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+            </form>
+        </td>
+    </tr>';
+    }
+
+    if ($mailboxRows === '') {
+        $mailboxRows = '<tr><td colspan="3">No mailboxes yet.</td></tr>';
+    }
+
+    $mailboxMessageEsc = $e($mailboxMessage);
 
     return '
 <div class="row">
@@ -390,6 +497,46 @@ function mailcow_ClientArea(array $params)
     <div class="col-sm-5 text-right"><strong>POP3 Server:</strong></div>
     <div class="col-sm-7 text-left"><pre>' . $pop3Host . '</pre></div>
 </div>
+
+<hr>
+
+<div class="row">
+    <center><strong>Mailboxes</strong></center><br>
+</div>
+
+' . ($mailboxMessageEsc !== '' ? '
+<div class="alert alert-info">' . $mailboxMessageEsc . '</div>
+' : '') . '
+
+<form method="post" class="form-inline" style="margin-bottom:15px;">
+    <input type="hidden" name="mailcow_action" value="create_mailbox">
+
+    <div class="form-group">
+        <label>Mailbox</label>
+        <input type="text" name="local_part" class="form-control" placeholder="info">
+        <span>@' . $domain . '</span>
+    </div>
+
+    <div class="form-group" style="margin-left:10px;">
+        <label>Password</label>
+        <input type="password" name="password" class="form-control" placeholder="Leave empty to generate">
+    </div>
+
+    <button type="submit" class="btn btn-primary" style="margin-left:10px;">Create Mailbox</button>
+</form>
+
+<table class="table table-striped">
+    <thead>
+        <tr>
+            <th>Email</th>
+            <th>Quota</th>
+            <th>Action</th>
+        </tr>
+    </thead>
+    <tbody>
+        ' . $mailboxRows . '
+    </tbody>
+</table>
 
 <hr>
 

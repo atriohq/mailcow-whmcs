@@ -55,10 +55,6 @@ class MailcowAPI
         return $this->_manageDomain($params['domain'], $params['configoptions'], 'create');
     }
 
-    public function addDkim($params){
-        return $this->_manageDomain($params['domain'], $params['configoptions'], 'create');
-    }
-
     public function editDomain($params){
         return $this->_manageDomain($params['domain'], $params['configoptions'], 'edit');
     }
@@ -327,27 +323,94 @@ class MailcowAPI
     public function getDkim(array $params): array
     {
         return $this->request(
-            'GET',
-            '/api/v1/get/dkim/' . rawurlencode($params['domain'])
+            '/api/v1/get/dkim/' . rawurlencode($params['domain']),
+            [],
+            'GET'
         );
     }
 
     public function addDkim(array $params): array
     {
         return $this->request(
-            'POST',
             '/api/v1/add/dkim',
             [
                 'domains' => $params['domain'],
                 'dkim_selector' => 'dkim',
                 'key_size' => 2048,
-            ]
+            ],
+            'POST'
         );
     }
 
     public function getStatus(): array
     {
-        return $this->request('GET', '/api/v1/get/status/containers');
+        return $this->request('/api/v1/get/status/containers', [], 'GET');
+    }
+
+    public function getMailboxes(array $params): array
+    {
+        return $this->request(
+            '/api/v1/get/mailbox/all/' . rawurlencode($params['domain']),
+            [],
+            'GET'
+        );
+    }
+
+    public function addMailbox(array $params, string $localPart, string $password, int $quotaMb): array
+    {
+        $localPart = strtolower(trim($localPart));
+        $domain = strtolower(trim($params['domain']));
+
+        if (!preg_match('/^[a-z0-9._%+\-]+$/i', $localPart)) {
+            throw new \InvalidArgumentException('Invalid mailbox name.');
+        }
+
+        if ($quotaMb <= 0) {
+            throw new \InvalidArgumentException('Invalid mailbox quota.');
+        }
+
+        $email = $localPart . '@' . $domain;
+
+        return $this->request(
+            '/api/v1/add/mailbox',
+            [
+                'local_part' => $localPart,
+                'domain' => $domain,
+                'name' => $email,
+                'password' => $password,
+                'password2' => $password,
+                'quota' => $quotaMb,
+                'active' => '1',
+                'force_pw_update' => '0',
+                'tls_enforce_in' => '0',
+                'tls_enforce_out' => '0',
+            ],
+            'POST'
+        );
+    }
+
+    public function deleteMailbox(string $email): array
+    {
+        return $this->request(
+            '/api/v1/delete/mailbox',
+            [$email],
+            'POST'
+        );
+    }
+
+    public function changeMailboxPassword(string $email, string $password): array
+    {
+        return $this->request(
+            '/api/v1/edit/mailbox',
+            [
+                'items' => [$email],
+                'attr' => [
+                    'password' => $password,
+                    'password2' => $password,
+                ],
+            ],
+            'POST'
+        );
     }
 
 }
