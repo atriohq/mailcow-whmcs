@@ -71,17 +71,21 @@ class MailcowAPI
         return $this->_manageDomain($params['domain'], $params['configoptions'], 'remove');
     }
 
-    private function _manageDomain($domain, $product_config, $action)
+    private function _manageDomain(string $domain, array $config, string $action)
     {
         $uri = '/api/v1/edit/domain';
+        $mailboxes = (int)($config['Max Mailboxes'] ?? $this->numMailboxes);
+        $defQuota = (int)($config['Default Mailbox Quota'] ?? $this->defaultQuota);
+        $maxQuota = (int)($config['Default Mailbox Quota'] ?? $this->mailboxQuota);
+        $domainQuota = $maxQuota * max(1, $mailboxes);
 
         $attr = [
-            'description' => (string) $domain,
-            'aliases' => (string) $this->aliases,
-            'mailboxes' => (string) $this->numMailboxes,
-            'defquota' => (string) $this->defaultQuota,
-            'maxquota' => (string) $this->mailboxQuota,
-            'quota' => (string) $this->mailboxQuota,
+            'description' => (string)$domain,
+            'aliases' => (string)$this->aliases,
+            'mailboxes' => (string)$mailboxes,
+            'defquota' => (string)$defQuota,
+            'maxquota' => (string)$maxQuota,
+            'quota' => (string)$domainQuota,
             'backupmx' => '0',
             'relay_all_recipients' => '0',
             'rl_value' => (string) $this->rateLimitValue,
@@ -289,6 +293,7 @@ class MailcowAPI
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_TIMEOUT => 30,
             CURLOPT_HTTPHEADER => [
                 'X-API-Key: ' . $this->apiKey,
                 'Content-Type: application/json',
@@ -334,7 +339,7 @@ class MailcowAPI
         return $this->request(
             '/api/v1/add/dkim',
             [
-                'domains' => $params['domain'],
+                'domain' => $params['domain'],
                 'dkim_selector' => 'dkim',
                 'key_size' => 2048,
             ],

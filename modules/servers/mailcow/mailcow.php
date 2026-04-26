@@ -393,7 +393,7 @@ function mailcow_ClientArea(array $params)
                     mailcow_getDefaultMailboxQuota($params)
                 );
 
-                $mailboxMessage = 'Mailbox created. Password: ' . $password;
+                $mailboxMessage = 'Mailbox created. Temporary password: ' . $password . ' Please save it now.';
             }
 
             if ($action === 'delete_mailbox') {
