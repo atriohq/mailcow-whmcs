@@ -324,4 +324,30 @@ class MailcowAPI
         return is_array($decoded) ? $decoded : ['raw' => $response];
     }
 
+    public function getDkim(array $params): array
+    {
+        return $this->request(
+            'GET',
+            '/api/v1/get/dkim/' . rawurlencode($params['domain'])
+        );
+    }
+
+    public function addDkim(array $params): array
+    {
+        return $this->request(
+            'POST',
+            '/api/v1/add/dkim',
+            [
+                'domains' => $params['domain'],
+                'dkim_selector' => 'dkim',
+                'key_size' => 2048,
+            ]
+        );
+    }
+
+    public function getStatus(): array
+    {
+        return $this->request('GET', '/api/v1/get/status/containers');
+    }
+
 }

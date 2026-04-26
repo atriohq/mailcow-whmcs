@@ -16,7 +16,6 @@ if (!defined("WHMCS")) {
 require_once __DIR__ . '/lib/MailcowAPI.php';
 
 use Mailcow\MailcowAPI;
-use WHMCS\Input\Sanitize;
 use WHMCS\Database\Capsule;
 
 function mailcow_MetaData()
@@ -27,29 +26,171 @@ function mailcow_MetaData()
         'RequiresServer' => true, // Set true if module requires a server to work
         'DefaultNonSSLPort' => '80', // Default Non-SSL Connection Port
         'DefaultSSLPort' => '443', // Default SSL Connection Port
-        'ServiceSingleSignOnLabel' => 'Login to Panel as User',
-        'AdminSingleSignOnLabel' => 'Login to Panel as Admin',
     );
 }
 
-function mailcow_ConfigOptions(){
-
-    return array(
-        'Default Mailbox Quota' => array(
+function mailcow_ConfigOptions()
+{
+    return [
+        'Default Mailbox Quota' => [
             'Type' => 'text',
             'Size' => '25',
             'Default' => '1024',
-            'Description' => 'When specifying per-account limits, this storage limit will be applied to each mailbox. Enter in megabytes',
-        )
-    );
+            'Description' => 'Per-mailbox storage limit in MB',
+        ],
+        'IMAP Hostname' => [
+            'Type' => 'text',
+            'Size' => '50',
+            'Default' => 'imap.example.com',
+            'Description' => 'Shown to customers as IMAP server',
+        ],
+        'SMTP Hostname' => [
+            'Type' => 'text',
+            'Size' => '50',
+            'Default' => 'smtp.example.com',
+            'Description' => 'Shown to customers as SMTP server',
+        ],
+        'POP3 Hostname' => [
+            'Type' => 'text',
+            'Size' => '50',
+            'Default' => 'pop.example.com',
+            'Description' => 'Shown to customers as POP3 server',
+        ],
+        'MX Hostname' => [
+            'Type' => 'text',
+            'Size' => '50',
+            'Default' => 'email.example.com',
+            'Description' => 'Shown to customers as MX target',
+        ],
+        'SPF Record' => [
+            'Type' => 'text',
+            'Size' => '80',
+            'Default' => 'v=spf1 mx -all',
+            'Description' => 'Shown to customers as SPF TXT record',
+        ],
+    ];
+}
+
+function mailcow_getAddress(array $params): string
+{
+    return trim((string)($params['serverhostname'] ?: $params['serverip'] ?: ''));
+}
+
+function mailcow_getServiceId(array $params): int
+{
+    $serviceId = (int)($params['serviceid'] ?? $params['accountid'] ?? 0);
+
+    if ($serviceId <= 0) {
+        throw new \RuntimeException('Unable to determine WHMCS service ID.');
+    }
+
+    return $serviceId;
+}
+
+function mailcow_ensureMappingTable(): void
+{
+    if (!Capsule::schema()->hasTable('mod_mailcow_domains')) {
+        Capsule::schema()->create('mod_mailcow_domains', function ($table) {
+            $table->increments('id');
+            $table->integer('service_id')->unsigned()->index();
+            $table->string('domain', 255)->index();
+            $table->string('domain_admin', 255)->nullable();
+            $table->boolean('is_primary')->default(false);
+            $table->string('status', 32)->default('active');
+            $table->timestamps();
+
+            $table->unique(['service_id', 'domain']);
+        });
+    }
+}
+
+function mailcow_saveDomainMapping(array $params, string $domain, bool $primary = true): void
+{
+    mailcow_ensureMappingTable();
+
+    $serviceId = mailcow_getServiceId($params);
+    $now = date('Y-m-d H:i:s');
+
+    $exists = Capsule::table('mod_mailcow_domains')
+        ->where('service_id', $serviceId)
+        ->where('domain', $domain)
+        ->exists();
+
+    if ($exists) {
+        Capsule::table('mod_mailcow_domains')
+            ->where('service_id', $serviceId)
+            ->where('domain', $domain)
+            ->update([
+                'domain_admin' => $params['username'] ?? null,
+                'is_primary' => $primary ? 1 : 0,
+                'status' => 'active',
+                'updated_at' => $now,
+            ]);
+    } else {
+        Capsule::table('mod_mailcow_domains')->insert([
+            'service_id' => $serviceId,
+            'domain' => $domain,
+            'domain_admin' => $params['username'] ?? null,
+            'is_primary' => $primary ? 1 : 0,
+            'status' => 'active',
+            'created_at' => $now,
+            'updated_at' => $now,
+        ]);
+    }
+}
+
+function mailcow_updateDomainMappingStatus(array $params, string $status): void
+{
+    mailcow_ensureMappingTable();
+
+    Capsule::table('mod_mailcow_domains')
+        ->where('service_id', mailcow_getServiceId($params))
+        ->update([
+            'status' => $status,
+            'updated_at' => date('Y-m-d H:i:s'),
+        ]);
 }
 
 function mailcow_CreateAccount(array $params)
 {
     try {
+        if (empty($params['domain']) || !filter_var($params['domain'], FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME)) {
+            return 'Invalid domain name.';
+        }
+
+        mailcow_ensureMappingTable();
+
         $mailcow = new MailcowAPI($params);
+
         $mailcow->addDomain($params);
-		$mailcow->addDomainAdmin($params);
+
+        try {
+            $mailcow->addDomainAdmin($params);
+        } catch (\Throwable $e) {
+            try {
+                $mailcow->removeDomain($params);
+            } catch (\Throwable $rollbackError) {
+                // Ignore rollback failure, original error is more useful.
+            }
+
+            throw $e;
+        }
+
+        // Generate DKIM automatically on provisioning.
+        try {
+            $mailcow->addDkim($params);
+        } catch (\Throwable $e) {
+            logModuleCall(
+                'mailcow',
+                __FUNCTION__ . ':addDkim',
+                ['domain' => $params['domain']],
+                $e->getMessage(),
+                $e->getTraceAsString()
+            );
+        }
+
+        mailcow_saveDomainMapping($params, $params['domain'], true);
+
     } catch (\Throwable $e) {
         return $e->getMessage();
     }
@@ -61,14 +202,12 @@ function mailcow_SuspendAccount(array $params)
 {
     try {
         $mailcow = new MailcowAPI($params);
-        $result = $mailcow->disableDomain($params);
-    } catch (\Throwable $e) {
-        return $e->getMessage();
-    }
 
-    try {
-        $mailcow = new MailcowAPI($params);
-        $result = $mailcow->disableDomainAdmin($params);
+        $mailcow->disableDomain($params);
+        $mailcow->disableDomainAdmin($params);
+
+        mailcow_updateDomainMappingStatus($params, 'suspended');
+
     } catch (\Throwable $e) {
         return $e->getMessage();
     }
@@ -80,14 +219,12 @@ function mailcow_UnsuspendAccount(array $params)
 {
     try {
         $mailcow = new MailcowAPI($params);
-        $result = $mailcow->activateDomain($params);
-    } catch (\Throwable $e) {
-        return $e->getMessage();
-    }
 
-    try {
-        $mailcow = new MailcowAPI($params);
-        $result = $mailcow->activateDomainAdmin($params);
+        $mailcow->activateDomain($params);
+        $mailcow->activateDomainAdmin($params);
+
+        mailcow_updateDomainMappingStatus($params, 'active');
+
     } catch (\Throwable $e) {
         return $e->getMessage();
     }
@@ -97,31 +234,37 @@ function mailcow_UnsuspendAccount(array $params)
 
 function mailcow_TerminateAccount(array $params)
 {
-    if ($params['status'] == "Terminated") {
-        return 'Account has already been deleted!';
-    } else {
-        try {
-          //Del MailBoxes
-          $mailcow = new MailcowAPI($params);
-          $result = $mailcow->removeDomainMailbox($params);
+    try {
+        $mailcow = new MailcowAPI($params);
 
-          //Del Aliases
-          $mailcow = new MailcowAPI($params);
-          $result = $mailcow->removeDomainAliases($params);
+        $steps = [
+            'removeDomainMailbox',
+            'removeDomainAliases',
+            'removeDomainAdmin',
+            'removeDomain',
+        ];
 
-          //Remove Domain
-          $mailcow = new MailcowAPI($params);
-          $result = $mailcow->removeDomain($params);
-
-          //Remove Domain Admin
-          $mailcow = new MailcowAPI($params);
-          $result = $mailcow->removeDomainAdmin($params);
-        } catch (\Throwable $e) {
-            return $e->getMessage();
+        foreach ($steps as $method) {
+            try {
+                $mailcow->{$method}($params);
+            } catch (\Throwable $e) {
+                logModuleCall(
+                    'mailcow',
+                    __FUNCTION__ . ':' . $method,
+                    ['domain' => $params['domain']],
+                    $e->getMessage(),
+                    $e->getTraceAsString()
+                );
+            }
         }
 
-        return 'success';
+        mailcow_updateDomainMappingStatus($params, 'terminated');
+
+    } catch (\Throwable $e) {
+        return $e->getMessage();
     }
+
+    return 'success';
 }
 
 function mailcow_ChangePassword(array $params)
@@ -133,7 +276,11 @@ function mailcow_ChangePassword(array $params)
         logModuleCall(
             'mailcow',
             __FUNCTION__,
-            print_r($params, true),
+            [
+                'serviceid' => $params['serviceid'] ?? null,
+                'domain' => $params['domain'] ?? null,
+                'username' => $params['username'] ?? null,
+            ],
             print_r($result, true),
             null
         );
@@ -142,7 +289,11 @@ function mailcow_ChangePassword(array $params)
         logModuleCall(
             'mailcow',
             __FUNCTION__,
-            print_r($params, true),
+            [
+                'serviceid' => $params['serviceid'] ?? null,
+                'domain' => $params['domain'] ?? null,
+                'username' => $params['username'] ?? null,
+            ],
             $e->getMessage(),
             $e->getTraceAsString()
         );
@@ -156,7 +307,8 @@ function mailcow_ChangePassword(array $params)
 function mailcow_TestConnection(array $params)
 {
     try {
-        new MailcowAPI($params);
+        $mailcow = new MailcowAPI($params);
+        $mailcow->getStatus();
 
         return [
             'success' => true,
@@ -176,126 +328,92 @@ function mailcow_TestConnection(array $params)
  */
 function mailcow_ClientArea(array $params)
 {
-    $address = ($params['serverhostname']) ? $params['serverhostname'] : $params['serverip'];
+    $address = mailcow_getAddress($params);
+
     if (empty($address)) {
         return '';
     }
 
-    $ch_dkim = curl_init();
-    curl_setopt($ch_dkim, CURLOPT_URL, "https://$address/api/v1/get/dkim/{$params['domain']}");
-    curl_setopt($ch_dkim, CURLOPT_RETURNTRANSFER, TRUE);
-    curl_setopt($ch_dkim, CURLOPT_HEADER, FALSE);
-    curl_setopt($ch_dkim, CURLOPT_HTTPHEADER, array(
-            "Content-Type: application/json",
-            "X-API-Key: {$params['serveraccesshash']}",
-    ));
-    
-    $response_dkim = curl_exec($ch_dkim);
-    curl_close($ch_dkim);
-
-    $data_dkim = json_decode($response_dkim, true);
-
-    if (empty($data_dkim['dkim_txt'])) {
-        $dkim = '<form method="POST"><input type="submit" name="gen_dkim" value="Add"></form>';
-
-        if (isset($_POST['gen_dkim'])){
-            $ch_dkim_add = curl_init();
-            curl_setopt($ch_dkim_add, CURLOPT_URL, "https://$address/api/v1/add/dkim");
-            curl_setopt($ch_dkim_add, CURLOPT_RETURNTRANSFER, TRUE);
-            curl_setopt($ch_dkim_add, CURLOPT_HEADER, FALSE);
-            curl_setopt($ch_dkim_add, CURLOPT_POST, TRUE);
-            curl_setopt($ch_dkim_add, CURLOPT_POSTFIELDS, "{
-              \"domains\": \"{$params['domain']}\",
-              \"dkim_selector\": \"dkim\",
-              \"key_size\": \"2048\"
-            }");
-            curl_setopt($ch_dkim_add, CURLOPT_HTTPHEADER, array(
-                    "Content-Type: application/json",
-                    "X-API-Key: {$params['serveraccesshash']}",
-            ));
-            $response_dkim = curl_exec($ch_dkim_add);
-            
-            curl_close($ch_dkim_add);
-            
-            header("Location: " . $_SERVER['REQUEST_URI']);
-        }
-    } else {
-        $dkim = $data_dkim['dkim_txt'];
+    try {
+        $mailcow = new MailcowAPI($params);
+        $data_dkim = $mailcow->getDkim($params);
+        $dkim = $data_dkim['dkim_txt'] ?? 'DKIM is not generated yet. Please contact support.';
+    } catch (\Throwable $e) {
+        $dkim = 'Unable to fetch DKIM record at this time.';
     }
 
-	$form = sprintf(
-      '<div class="row">
-<div class="col-sm-5 text-right">
-<strong>Username</strong>
-</div>
-<div class="col-sm-7 text-left">
-' . $params["username"] . '
-</div>
+    $e = static function ($value): string {
+        return htmlspecialchars((string)$value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    };
+
+    $domain = $e($params['domain'] ?? '');
+    $username = $e($params['username'] ?? '');
+    $addressEsc = $e($address);
+
+    $imapHost = $e($params['configoption2'] ?? 'imap.example.com');
+    $smtpHost = $e($params['configoption3'] ?? 'smtp.example.com');
+    $pop3Host = $e($params['configoption4'] ?? 'pop.example.com');
+    $mxHost = $e($params['configoption5'] ?? 'email.example.com');
+    $spfRecord = $e($params['configoption6'] ?? 'v=spf1 mx -all');
+    $dkimEsc = $e($dkim);
+
+    return '
+<div class="row">
+    <div class="col-sm-5 text-right"><strong>Username</strong></div>
+    <div class="col-sm-7 text-left">' . $username . '</div>
 </div>
 
 <div class="row">
-<div class="col-sm-5 text-right">
-<strong>Mail Server</strong>
+    <div class="col-sm-5 text-right"><strong>Mail Panel</strong></div>
+    <div class="col-sm-7 text-left">
+        <a href="https://' . $addressEsc . '" target="_blank" rel="noopener noreferrer">' . $addressEsc . '</a>
+    </div>
 </div>
-<div class="col-sm-7 text-left">
-<a href="https://' . $address . '" target="_blank">' . $address . '</a>
-</div>
-</div>
-<hr> 
+
+<hr>
 
 <div class="row">
-<center>
-<strong>DNS Records</strong>
-</center>
-<br>
+    <center><strong>Mail Settings</strong></center><br>
 </div>
 
 <div class="row">
-<div class="col-sm-5 text-right">
-<strong>mail.' . $params['domain'] . ' (A):</strong>
-</div>
-<div class="col-sm-7 text-left">
-<pre>' . $params['serverip'] . '</pre>
-</div>
+    <div class="col-sm-5 text-right"><strong>IMAP Server:</strong></div>
+    <div class="col-sm-7 text-left"><pre>' . $imapHost . '</pre></div>
 </div>
 
 <div class="row">
-<div class="col-sm-5 text-right">
-<strong>dkim._domainkey.' . $params['domain'] . ' (TXT):</strong>
-</div>
-<div class="col-sm-7 text-left">
-<pre>' . $dkim . '</pre>
-</div>
+    <div class="col-sm-5 text-right"><strong>SMTP Server:</strong></div>
+    <div class="col-sm-7 text-left"><pre>' . $smtpHost . '</pre></div>
 </div>
 
 <div class="row">
-<div class="col-sm-5 text-right">
-<strong>' . $params['domain'] . ' (MX):</strong>
+    <div class="col-sm-5 text-right"><strong>POP3 Server:</strong></div>
+    <div class="col-sm-7 text-left"><pre>' . $pop3Host . '</pre></div>
 </div>
-<div class="col-sm-7 text-left">
-<pre>mail.' . $params['domain'] . '</pre>
-</div>
+
+<hr>
+
+<div class="row">
+    <center><strong>DNS Records</strong></center><br>
 </div>
 
 <div class="row">
-<div class="col-sm-5 text-right">
-<strong>_dmarc.' . $params['domain'] . ' (TXT):</strong>
-</div>
-<div class="col-sm-7 text-left">
-<pre>v=DMARC1;p=none</pre>
-</div>
+    <div class="col-sm-5 text-right"><strong>' . $domain . ' MX:</strong></div>
+    <div class="col-sm-7 text-left"><pre>10 ' . $mxHost . '</pre></div>
 </div>
 
 <div class="row">
-<div class="col-sm-5 text-right">
-<strong>' . $params['domain'] . ' (TXT):</strong>
+    <div class="col-sm-5 text-right"><strong>dkim._domainkey.' . $domain . ' TXT:</strong></div>
+    <div class="col-sm-7 text-left"><pre>' . $dkimEsc . '</pre></div>
 </div>
-<div class="col-sm-7 text-left">
-<pre>v=spf1 a mx -all</pre>
-</div>
-</div>
-'
-  );
 
-    return $form;
+<div class="row">
+    <div class="col-sm-5 text-right"><strong>_dmarc.' . $domain . ' TXT:</strong></div>
+    <div class="col-sm-7 text-left"><pre>v=DMARC1; p=none</pre></div>
+</div>
+
+<div class="row">
+    <div class="col-sm-5 text-right"><strong>' . $domain . ' TXT:</strong></div>
+    <div class="col-sm-7 text-left"><pre>' . $spfRecord . '</pre></div>
+</div>';
 }
